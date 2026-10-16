@@ -1,406 +1,277 @@
-
-if not game:IsLoaded() then
-    game.Loaded:Wait()
-end
-
 local Players = game:GetService("Players")
 local HttpService = game:GetService("HttpService")
-
+local TweenService = game:GetService("TweenService")
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
 local env = (type(getgenv) == "function" and getgenv()) or _G
 
-local API = "https://api.scripts4u.site"
+local API = "https://scripts4u-faf-api.darscripts.workers.dev"
 local KEY_WEBSITE = "https://getkey.scripts4u.site"
 local SAVE_FILE = "scripts4u_faf_key.txt"
+local KEY_PATTERN = "^S4U%-FREE%-%x+$"
 
 local function getDeviceId()
     local candidates = {
         env.gethwid,
         env.get_hwid,
-        gethwid,
-        get_hwid
+        (type(gethwid) == "function" and gethwid or nil),
+        (type(get_hwid) == "function" and get_hwid or nil)
     }
-
     for _, fn in pairs(candidates) do
         if type(fn) == "function" then
-            local ok, result = pcall(fn)
-
-            if ok and type(result) == "string" and #result >= 8 then
-                return result
+            local ok, value = pcall(fn)
+            if ok and type(value) == "string" and #value >= 8 then
+                return value
             end
         end
     end
 
-    local ok, result = pcall(function()
+    -- Fallback client identifier; not a hardware-secure ID.
+    local ok, value = pcall(function()
         return game:GetService("RbxAnalyticsService"):GetClientId()
     end)
-
-    if ok and type(result) == "string" and #result >= 8 then
-        return result
+    if ok and type(value) == "string" and #value >= 8 then
+        return value
     end
-
     return nil
 end
 
-local function getRequest()
-    local candidates = {
-        env.request,
-        env.http_request,
-        request,
-        http_request,
-        syn and syn.request,
-        http and http.request
-    }
+local function post(path, payload)
+    local fn = (type(env.request) == "function" and env.request)
+        or (type(env.http_request) == "function" and env.http_request)
+        or (type(request) == "function" and request)
+        or (type(http_request) == "function" and http_request)
+        or (type(syn) == "table" and type(syn.request) == "function" and syn.request)
+        or (type(http) == "table" and type(http.request) == "function" and http.request)
 
-    for _, fn in pairs(candidates) do
-        if type(fn) == "function" then
-            return fn
-        end
-    end
-
-    return nil
-end
-
-local function post(path, data)
-    local requestFn = getRequest()
-
-    if not requestFn then
-        return false, 0, "executor does not support HTTP requests"
-    end
-
-    local ok, response = pcall(requestFn, {
+    local options = {
         Url = API .. path,
         Method = "POST",
-        Headers = {
-            ["Content-Type"] = "application/json"
-        },
-        Body = HttpService:JSONEncode(data)
-    })
+        Headers = { ["Content-Type"] = "application/json" },
+        Body = HttpService:JSONEncode(payload)
+    }
 
+    local ok, response
+    if fn then
+        ok, response = pcall(fn, options)
+    else
+        ok, response = pcall(function()
+            return HttpService:RequestAsync(options)
+        end)
+    end
     if not ok or type(response) ~= "table" then
-        return false, 0, "connection failed"
+        return false, 0, "HTTP POST is unavailable in this executor"
     end
 
-    local code = tonumber(
-        response.StatusCode or response.Status or response.status_code
-    ) or 0
-
+    local status = tonumber(response.StatusCode or response.Status or response.status_code) or 0
     local body = response.Body or response.body or ""
-
-    if type(body) ~= "string" then
-        body = tostring(body)
-    end
-
-    return code >= 200 and code < 300, code, body
+    if type(body) ~= "string" then body = tostring(body) end
+    return status >= 200 and status < 300, status, body
 end
 
-local function getError(body)
-    local ok, data = pcall(function()
-        return HttpService:JSONDecode(body)
-    end)
-
+local function decodeError(body)
+    if body == "HTTP POST is unavailable in this executor" then
+        return body
+    end
+    local ok, data = pcall(function() return HttpService:JSONDecode(body) end)
     if ok and type(data) == "table" then
         return tostring(data.error or data.reason or "verification failed")
     end
-
-    return body ~= "" and body or "connection failed"
+    return "verification failed"
 end
 
-local function readSavedKey()
-    local reader = env.readfile or readfile
-
-    if type(reader) == "function" then
+local function loadSavedKey()
+    local reader = (type(env.readfile) == "function" and env.readfile)
+        or (type(readfile) == "function" and readfile)
+    if reader then
         local ok, value = pcall(reader, SAVE_FILE)
-
         if ok and type(value) == "string" then
             return value:gsub("%s+", "")
         end
     end
-
-    return type(env.Scripts4USavedKey) == "string"
-        and env.Scripts4USavedKey or ""
+    return type(env.Scripts4USavedKey) == "string" and env.Scripts4USavedKey or ""
 end
 
 local function saveKey(key)
     env.Scripts4USavedKey = key
-
-    local writer = env.writefile or writefile
-
-    if type(writer) == "function" then
-        pcall(writer, SAVE_FILE, key)
-    end
+    local writer = (type(env.writefile) == "function" and env.writefile)
+        or (type(writefile) == "function" and writefile)
+    if writer then pcall(writer, SAVE_FILE, key) end
 end
 
-local function deleteSavedKey()
+local function forgetKey()
     env.Scripts4USavedKey = nil
-
-    local remover = env.delfile or delfile
-
-    if type(remover) == "function" then
-        pcall(remover, SAVE_FILE)
-    end
+    local remover = (type(env.delfile) == "function" and env.delfile)
+        or (type(delfile) == "function" and delfile)
+    if remover then pcall(remover, SAVE_FILE) end
 end
 
-local previous = playerGui:FindFirstChild("Scripts4UAuth")
+local old = playerGui:FindFirstChild("Scripts4UAuth")
+if old then old:Destroy() end
 
-if previous then
-    previous:Destroy()
+local gui = Instance.new("ScreenGui")
+gui.Name = "Scripts4UAuth"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.DisplayOrder = 2000
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.Parent = playerGui
+
+local function make(class, props, parent)
+    local item = Instance.new(class)
+    for k, v in pairs(props) do item[k] = v end
+    item.Parent = parent
+    return item
 end
 
-local function create(class, properties, parent)
-    local instance = Instance.new(class)
+local bg = Color3.fromRGB(12, 12, 13)
+local surface = Color3.fromRGB(24, 24, 26)
+local border = Color3.fromRGB(69, 69, 72)
+local white = Color3.fromRGB(245, 245, 245)
+local muted = Color3.fromRGB(151, 151, 155)
 
-    for property, value in pairs(properties) do
-        instance[property] = value
-    end
-
-    instance.Parent = parent
-
-    return instance
-end
-
-local colors = {
-    background = Color3.fromRGB(13, 13, 14),
-    surface = Color3.fromRGB(25, 25, 27),
-    border = Color3.fromRGB(67, 67, 70),
-    white = Color3.fromRGB(245, 245, 245),
-    muted = Color3.fromRGB(151, 151, 155)
-}
-
-local gui = create("ScreenGui", {
-    Name = "Scripts4UAuth",
-    ResetOnSpawn = false,
-    IgnoreGuiInset = true,
-    DisplayOrder = 2000,
-    ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-}, playerGui)
-
-local frame = create("Frame", {
+local frame = make("Frame", {
     Name = "KeyWindow",
     AnchorPoint = Vector2.new(0.5, 0.5),
     Position = UDim2.fromScale(0.5, 0.5),
-    Size = UDim2.fromOffset(440, 270),
-    BackgroundColor3 = colors.background,
-    BackgroundTransparency = 0.06,
+    Size = UDim2.fromOffset(440, 260),
+    BackgroundColor3 = bg,
+    BackgroundTransparency = 0.08,
     BorderSizePixel = 0,
     Active = true
 }, gui)
+make("UICorner", {CornerRadius = UDim.new(0, 4)}, frame)
+make("UIStroke", {Color = border, Transparency = 0.2, Thickness = 1}, frame)
 
-create("UICorner", {
-    CornerRadius = UDim.new(0, 5)
-}, frame)
-
-create("UIStroke", {
-    Color = colors.border,
-    Transparency = 0.25,
-    Thickness = 1
-}, frame)
-
-local uiScale = create("UIScale", {
-    Scale = 1
-}, frame)
-
-local function updateScale()
+local scale = make("UIScale", {Scale = 1}, frame)
+local function resize()
     local camera = workspace.CurrentCamera
-
-    if not camera then
-        return
-    end
-
-    local viewport = camera.ViewportSize
-
-    uiScale.Scale = math.clamp(
-        math.min(
-            (viewport.X - 24) / 440,
-            (viewport.Y - 24) / 270
-        ),
-        0.45,
-        1
-    )
+    local size = camera and camera.ViewportSize or Vector2.new(1280, 720)
+    scale.Scale = math.clamp(math.min((size.X - 24) / 440, (size.Y - 24) / 260), 0.45, 1)
 end
+resize()
 
-updateScale()
-
-create("ImageLabel", {
-    Name = "Scripts4UBanner",
+local banner = make("ImageLabel", {
     BackgroundTransparency = 1,
-    Position = UDim2.fromOffset(120, 14),
-    Size = UDim2.fromOffset(200, 50),
+    Position = UDim2.fromOffset(120, 15),
+    Size = UDim2.fromOffset(200, 48),
     Image = "rbxassetid://105601293945742",
     ScaleType = Enum.ScaleType.Fit
 }, frame)
 
-create("Frame", {
-    Position = UDim2.fromOffset(20, 73),
+make("Frame", {
+    Position = UDim2.fromOffset(20, 70),
     Size = UDim2.fromOffset(400, 1),
-    BackgroundColor3 = colors.border,
-    BackgroundTransparency = 0.4,
+    BackgroundColor3 = border,
+    BackgroundTransparency = 0.45,
     BorderSizePixel = 0
 }, frame)
 
-create("TextLabel", {
+make("TextLabel", {
     BackgroundTransparency = 1,
-    Position = UDim2.fromOffset(20, 84),
+    Position = UDim2.fromOffset(20, 82),
     Size = UDim2.fromOffset(400, 22),
     Text = "enter your key to continue",
     Font = Enum.Font.Gotham,
     TextSize = 13,
-    TextColor3 = colors.muted,
-    TextXAlignment = Enum.TextXAlignment.Center
+    TextColor3 = muted
 }, frame)
 
-local keyInput = create("TextBox", {
-    Name = "KeyInput",
-    Position = UDim2.fromOffset(20, 117),
-    Size = UDim2.fromOffset(400, 42),
-    BackgroundColor3 = colors.surface,
+local input = make("TextBox", {
+    Position = UDim2.fromOffset(20, 114),
+    Size = UDim2.fromOffset(400, 40),
+    BackgroundColor3 = surface,
     BorderSizePixel = 0,
     ClearTextOnFocus = false,
     PlaceholderText = "S4U-FREE-...",
-    PlaceholderColor3 = colors.muted,
-    Text = readSavedKey(),
-    TextColor3 = colors.white,
+    PlaceholderColor3 = muted,
+    Text = loadSavedKey(),
+    TextColor3 = white,
     TextSize = 13,
     Font = Enum.Font.Code,
     TextXAlignment = Enum.TextXAlignment.Left
 }, frame)
-
-create("UICorner", {
-    CornerRadius = UDim.new(0, 4)
-}, keyInput)
-
-create("UIStroke", {
-    Color = colors.border,
-    Transparency = 0.35,
-    Thickness = 1
-}, keyInput)
-
-create("UIPadding", {
+make("UICorner", {CornerRadius = UDim.new(0, 4)}, input)
+make("UIStroke", {Color = border, Transparency = 0.35}, input)
+make("UIPadding", {
     PaddingLeft = UDim.new(0, 12),
     PaddingRight = UDim.new(0, 12)
-}, keyInput)
+}, input)
 
-local function createButton(label, x, background, foreground)
-    local button = create("TextButton", {
-        Position = UDim2.fromOffset(x, 169),
-        Size = UDim2.fromOffset(194, 40),
-        BackgroundColor3 = background,
+local function button(text, x, color, textColor)
+    local b = make("TextButton", {
+        Position = UDim2.fromOffset(x, 164),
+        Size = UDim2.fromOffset(194, 38),
+        BackgroundColor3 = color,
         BorderSizePixel = 0,
-        Text = label,
-        TextColor3 = foreground,
+        Text = text,
+        TextColor3 = textColor,
         TextSize = 13,
         Font = Enum.Font.GothamBold,
         AutoButtonColor = true
     }, frame)
-
-    create("UICorner", {
-        CornerRadius = UDim.new(0, 4)
-    }, button)
-
-    return button
+    make("UICorner", {CornerRadius = UDim.new(0, 4)}, b)
+    return b
 end
 
-local verifyButton = createButton(
-    "verify key",
-    20,
-    colors.white,
-    colors.background
-)
+local verifyButton = button("verify key", 20, white, bg)
+local getKeyButton = button("get key", 226, surface, white)
 
-local getKeyButton = createButton(
-    "get key",
-    226,
-    colors.surface,
-    colors.white
-)
-
-create("UIStroke", {
-    Color = colors.border,
-    Transparency = 0.4,
-    Thickness = 1
-}, getKeyButton)
-
-local rememberKey = true
-
-local rememberButton = create("TextButton", {
-    Position = UDim2.fromOffset(20, 220),
-    Size = UDim2.fromOffset(170, 22),
+local remember = true
+local rememberButton = make("TextButton", {
+    Position = UDim2.fromOffset(20, 213),
+    Size = UDim2.fromOffset(180, 20),
     BackgroundTransparency = 1,
     Text = "remember key: on",
-    TextColor3 = colors.muted,
+    TextColor3 = muted,
     TextSize = 12,
     Font = Enum.Font.Gotham,
     TextXAlignment = Enum.TextXAlignment.Left
 }, frame)
 
-local statusLabel = create("TextLabel", {
-    Position = UDim2.fromOffset(190, 220),
-    Size = UDim2.fromOffset(230, 22),
+local statusLabel = make("TextLabel", {
+    Position = UDim2.fromOffset(190, 212),
+    Size = UDim2.fromOffset(230, 25),
     BackgroundTransparency = 1,
     Text = "",
-    TextColor3 = colors.muted,
+    TextColor3 = muted,
     TextSize = 11,
     Font = Enum.Font.Gotham,
     TextXAlignment = Enum.TextXAlignment.Right,
     TextTruncate = Enum.TextTruncate.AtEnd
 }, frame)
 
-create("TextLabel", {
-    Position = UDim2.fromOffset(20, 247),
-    Size = UDim2.fromOffset(400, 15),
-    BackgroundTransparency = 1,
-    Text = "free keys last 24 hours after activation",
-    TextColor3 = colors.muted,
-    TextTransparency = 0.25,
-    TextSize = 10,
-    Font = Enum.Font.Gotham,
-    TextXAlignment = Enum.TextXAlignment.Center
-}, frame)
-
 local busy = false
-
-local function setStatus(message)
-    if gui.Parent then
-        statusLabel.Text = message
-    end
+local function status(message)
+    if gui.Parent then statusLabel.Text = message end
 end
 
-local function verifyKey()
-    if busy or not gui.Parent then
-        return
-    end
-
-    local key = keyInput.Text:gsub("%s+", ""):upper()
-
-    if #key ~= 57 or not key:match("^S4U%-FREE%-%x+$") then
-        setStatus("invalid key format")
+local function verify()
+    if busy or not gui.Parent then return end
+    local key = input.Text:gsub("%s+", ""):upper()
+    if #key ~= 57 or not key:match(KEY_PATTERN) then
+        status("invalid key format")
         return
     end
 
     local deviceId = getDeviceId()
-
     if not deviceId then
-        setStatus("device ID unavailable")
+        status("device ID unavailable")
         return
     end
 
     busy = true
     verifyButton.Text = "verifying..."
-    setStatus("checking key")
+    status("checking key")
 
     task.spawn(function()
-        local success, _, body = post("/api/activate", {
+        local ok, _, body = post("/api/activate", {
             key = key,
             hwid = deviceId
         })
-
-        if not gui.Parent then
-            return
-        end
-
-        if not success then
-            setStatus(getError(body))
+        if not gui.Parent then return end
+        if not ok then
+            status(decodeError(body))
             verifyButton.Text = "verify key"
             busy = false
             return
@@ -409,96 +280,70 @@ local function verifyKey()
         local decoded, result = pcall(function()
             return HttpService:JSONDecode(body)
         end)
-
         if not decoded or type(result) ~= "table" or not result.ok then
-            setStatus("invalid server response")
+            status("invalid server response")
             verifyButton.Text = "verify key"
             busy = false
             return
         end
 
-        setStatus("loading farming and friends")
-
+        status("loading farming and friends")
         local delivered, _, source = post("/api/faf", {
             key = key,
             hwid = deviceId
         })
-
-        if not gui.Parent then
-            return
-        end
-
+        if not gui.Parent then return end
         if not delivered then
-            setStatus(getError(source))
+            status(decodeError(source))
             verifyButton.Text = "verify key"
             busy = false
             return
         end
 
         if source == "" then
-            setStatus("script unavailable")
+            status("script response was incomplete")
             verifyButton.Text = "verify key"
             busy = false
             return
         end
 
         local execute, compileError = loadstring(source)
-
         if not execute then
-            setStatus("failed to compile script")
-            warn("[scripts4u] " .. tostring(compileError))
+            status("script compilation failed")
+            warn("[scripts4u]", compileError)
             verifyButton.Text = "verify key"
             busy = false
             return
         end
 
-        if rememberKey then
-            saveKey(key)
-        else
-            deleteSavedKey()
-        end
-
+        if remember then saveKey(key) else forgetKey() end
         gui:Destroy()
-
         local ran, runtimeError = pcall(execute)
-
-        if not ran then
-            warn("[scripts4u] " .. tostring(runtimeError))
-        end
+        if not ran then warn("[scripts4u] FAF error:", runtimeError) end
     end)
 end
 
-verifyButton.MouseButton1Click:Connect(verifyKey)
-
-keyInput.FocusLost:Connect(function(enterPressed)
-    if enterPressed then
-        verifyKey()
-    end
+verifyButton.MouseButton1Click:Connect(verify)
+input.FocusLost:Connect(function(enterPressed)
+    if enterPressed then verify() end
 end)
 
 getKeyButton.MouseButton1Click:Connect(function()
-    local clipboard = env.setclipboard or setclipboard
-
-    if type(clipboard) == "function" then
+    local clipboard = (type(env.setclipboard) == "function" and env.setclipboard)
+        or (type(setclipboard) == "function" and setclipboard)
+    if clipboard then
         local ok = pcall(clipboard, KEY_WEBSITE)
-
-        if ok then
-            setStatus("key link copied")
-        else
-            setStatus(KEY_WEBSITE)
-        end
+        status(ok and "key link copied" or KEY_WEBSITE)
     else
-        setStatus(KEY_WEBSITE)
+        status(KEY_WEBSITE)
     end
 end)
 
 rememberButton.MouseButton1Click:Connect(function()
-    rememberKey = not rememberKey
-
-    rememberButton.Text = "remember key: "
-        .. (rememberKey and "on" or "off")
+    remember = not remember
+    rememberButton.Text = "remember key: " .. (remember and "on" or "off")
 end)
 
-if keyInput.Text ~= "" then
-    task.defer(verifyKey)
+if input.Text ~= "" then
+    task.defer(verify)
 end
